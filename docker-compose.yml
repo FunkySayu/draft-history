@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000" # Expose for direct access if needed, though Nginx will proxy
+    volumes:
+      - ./api:/app # Mount for development; remove for production image
+      - api_db_data:/app/data # Named volume for SQLite DB persistence
+    environment:
+      - FLASK_ENV=development # Or production
+      - DATABASE_URL=sqlite:////app/data/app.db # Path inside container, persisted by volume
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    ports:
+      - "4201:80" # Map host 4201 to ui Nginx port 80 for direct access/debugging
+                  # Nginx reverse proxy will access it via its internal port 80
+    volumes:
+      - ./ui:/app # Mount for development; remove for production image
+      - /app/node_modules # Anonymous volume to prevent host node_modules from overwriting container's
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80" # Main entry point: Host port 8080 maps to Nginx container port 80
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro # Mount our custom Nginx config
+      # If using default.conf:
+      # - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+      - ui
+    restart: unless-stopped
+
+volumes:
+  api_db_data: # Named volume to persist SQLite database data for the API service
