@@ -24,7 +24,7 @@
     "@angular/core": "^20.0.0",
     "@angular/forms": "^20.0.0",
     "@angular/platform-browser": "^20.0.0",
-    "@angular/animations": "^20.0.0", # Added this line
+    "@angular/animations": "^20.0.0",
     "@angular/router": "^20.0.0",
     "@angular/material": "^20.0.0",
     "@angular/cdk": "^20.0.0",
