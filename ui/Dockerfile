@@ -1,5 +1,5 @@
 # Stage 1: Build the Angular application
-FROM node:18 AS build
+FROM node:22-slim AS build
 WORKDIR /app
 COPY package*.json ./
 # In the bash session, current directory was /app/ui, so files were created there.
