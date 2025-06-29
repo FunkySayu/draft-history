@@ -26,3 +26,27 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+VENV/
+
+# Databases - Exclude the data directory which might contain large sample/generated DBs
+# The initial sample data/league_data.db is intentionally committed once.
+# This entry will prevent future changes or additions to data/ from being tracked.
+data/
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
