@@ -3,3 +3,4 @@ Flask-SQLAlchemy>=2.5
 SQLAlchemy>=1.4
 psycopg2-binary # For PostgreSQL, if used
 Werkzeug>=2.0 # Werkzeug is a dependency of Flask, ensure it's compatible.
+mwrogue
