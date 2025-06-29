@@ -1,8 +1,16 @@
-import sqlite3
-from mwrogue.esports_client import EsportsClient
+import os
+import sys
 import time
+import argparse # For --limit argument
+from mwrogue.esports_client import EsportsClient
+from sqlalchemy import func
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-DB_NAME = 'league_data.db'
+from ..models_base import get_session
+from ..scoreboard_game_model import ScoreboardGame
+from ..picks_and_bans_model import PicksAndBansS7Model
+
+
 BATCH_SIZE = 100
 
 # --- Mappings from DB schema column names to API field names ---
@@ -26,308 +34,226 @@ DB_TO_API_KEY_MAP_PB = {
     'GameID_Wiki': 'GameID Wiki',
 }
 
-# --- Database Utility Functions ---
-def get_db_connection():
-    return sqlite3.connect(DB_NAME)
-
+# --- Database Utility Functions (SQLAlchemy) ---
 def get_last_collected_timestamp():
-    """Fetches the most recent DateTime_UTC from the local ScoreboardGames table."""
-    import os
-    if not os.path.exists(DB_NAME):
-        print(f"Database file {DB_NAME} does not exist. Starting fresh.")
-        return None
-
-    conn = None
+    session = get_session()
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT MAX(DateTime_UTC) FROM ScoreboardGames")
-        result = cursor.fetchone()
-        if result and result[0]:
-            print(f"Successfully fetched last collected timestamp: {result[0]}")
-            return result[0]
+        max_timestamp = session.query(func.max(ScoreboardGame.DateTime_UTC)).scalar()
+        if max_timestamp:
+            print(f"Successfully fetched last collected timestamp: {max_timestamp}")
+            return max_timestamp
         else:
-            # Check if table is empty or all timestamps are NULL
-            cursor.execute("SELECT COUNT(*) FROM ScoreboardGames")
-            count = cursor.fetchone()[0]
+            count = session.query(func.count(ScoreboardGame.GameId)).scalar()
             if count > 0:
                 print(f"No valid MAX(DateTime_UTC) found in ScoreboardGames, but table has {count} rows. Treating as fresh start for timestamp.")
             else:
                 print("ScoreboardGames table is empty or contains no valid timestamps. Starting fresh.")
             return None
-    except sqlite3.Error as e:
-        print(f"SQLite error in get_last_collected_timestamp: {e}")
+    except Exception as e:
+        print(f"SQLAlchemy error in get_last_collected_timestamp: {e}")
         return None
     finally:
-        if conn:
-            conn.close()
+        session.close()
 
-def get_existing_game_ids():
-    """Fetches all existing GameIds from the ScoreboardGames table."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT GameId FROM ScoreboardGames")
-    result = cursor.fetchall()
-    conn.close()
-    return {row[0] for row in result}
+# --- Data Insertion Functions (SQLAlchemy) ---
+def insert_scoreboard_games_batch(session, data_dicts):
+    if not data_dicts: return 0
+    objects_to_insert = []
+    for api_row_dict in data_dicts:
+        model_data = {}
+        for model_attr in ScoreboardGame.__table__.columns.keys():
+            api_key = DB_TO_API_KEY_MAP_SG.get(model_attr, model_attr)
+            if api_key in api_row_dict: # Check if API provided this key
+                 model_data[model_attr] = api_row_dict.get(api_key)
 
-def get_existing_pb_unique_lines():
-    """Fetches all existing UniqueLines from the PicksAndBansS7 table."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT UniqueLine FROM PicksAndBansS7")
-    result = cursor.fetchall()
-    conn.close()
-    return {row[0] for row in result}
+        if not model_data.get('GameId'):
+            # print(f"Skipping ScoreboardGame data due to missing GameId: {api_row_dict.get('GameId', 'N/A')}") # Can be verbose
+            continue
+        objects_to_insert.append(model_data)
 
-# --- Data Insertion Functions ---
-def insert_scoreboard_games_batch(data):
-    if not data:
+    if not objects_to_insert:
+        # print("No valid ScoreboardGame objects to insert after processing.") # Can be verbose
         return 0
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    placeholders = ', '.join(['?'] * len(data[0]))
-    # Assuming data[0] contains keys in the correct order matching the table schema
-    # This needs to be robust. Let's get column names from the schema.
-    cursor.execute("PRAGMA table_info(ScoreboardGames)")
-    schema_columns = [col[1] for col in cursor.fetchall()]
-
-    placeholders = ', '.join(['?'] * len(schema_columns))
-
-    ordered_data = []
-    for row_dict in data: # data from API
-        ordered_row = []
-        for db_col_name in schema_columns: # e.g., "DateTime_UTC"
-            api_key = DB_TO_API_KEY_MAP_SG.get(db_col_name, db_col_name)
-            ordered_row.append(row_dict.get(api_key))
-        ordered_data.append(tuple(ordered_row))
 
     try:
-        cursor.executemany(f"INSERT OR IGNORE INTO ScoreboardGames ({', '.join(schema_columns)}) VALUES ({placeholders})", ordered_data)
-        conn.commit()
-        inserted_rows = cursor.rowcount
-        print(f"Inserted {inserted_rows} new rows into ScoreboardGames.")
-        return inserted_rows
-    except sqlite3.Error as e:
-        print(f"SQLite error during ScoreboardGames batch insert: {e}")
+        stmt = sqlite_insert(ScoreboardGame).values(objects_to_insert)
+        stmt = stmt.on_conflict_do_nothing(index_elements=[ScoreboardGame.GameId])
+        result = session.execute(stmt)
+        print(f"Attempted to insert {len(objects_to_insert)} ScoreboardGames. Rows affected: {result.rowcount}")
+        return result.rowcount
+    except Exception as e: print(f"SQLAlchemy error during SG batch insert: {e}"); return 0
+
+def insert_picks_and_bans_batch(session, data_dicts):
+    if not data_dicts: return 0
+    objects_to_insert = []
+    for api_row_dict in data_dicts:
+        model_data = {}
+        for model_attr in PicksAndBansS7Model.__table__.columns.keys():
+            api_key = DB_TO_API_KEY_MAP_PB.get(model_attr, model_attr)
+            if api_key in api_row_dict: # Check if API provided this key
+                model_data[model_attr] = api_row_dict.get(api_key)
+
+        if not model_data.get('UniqueLine'):
+            # print(f"Skipping PicksAndBansS7 data due to missing UniqueLine: {api_row_dict.get('UniqueLine', 'N/A')}") # Can be verbose
+            continue
+
+        for bool_field_name in ['IsComplete', 'IsFilled']:
+            api_val = model_data.get(bool_field_name)
+            if isinstance(api_val, str):
+                if api_val.lower() in ['true', '1', 'yes', 't']: model_data[bool_field_name] = True
+                elif api_val.lower() in ['false', '0', 'no', 'f']: model_data[bool_field_name] = False
+                else: model_data[bool_field_name] = None
+            elif isinstance(api_val, int): model_data[bool_field_name] = bool(api_val)
+
+        objects_to_insert.append(model_data)
+
+    if not objects_to_insert:
+        # print("No valid PicksAndBansS7 objects to insert after processing.") # Can be verbose
         return 0
-    finally:
-        conn.close()
-
-def insert_picks_and_bans_batch(data):
-    if not data:
-        return 0
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("PRAGMA table_info(PicksAndBansS7)")
-    schema_columns = [col[1] for col in cursor.fetchall()]
-
-    placeholders = ', '.join(['?'] * len(schema_columns))
-
-    ordered_data = []
-    for row_dict in data: # data from API
-        ordered_row = []
-        for db_col_name in schema_columns: # e.g., "GameID_Wiki"
-            api_key = DB_TO_API_KEY_MAP_PB.get(db_col_name, db_col_name)
-            ordered_row.append(row_dict.get(api_key))
-        ordered_data.append(tuple(ordered_row))
 
     try:
-        cursor.executemany(f"INSERT OR IGNORE INTO PicksAndBansS7 ({', '.join(schema_columns)}) VALUES ({placeholders})", ordered_data)
-        conn.commit()
-        inserted_rows = cursor.rowcount
-        print(f"Inserted {inserted_rows} new rows into PicksAndBansS7.")
-        return inserted_rows
-    except sqlite3.Error as e:
-        print(f"SQLite error during PicksAndBansS7 batch insert: {e}")
-        return 0
-    finally:
-        conn.close()
+        stmt = sqlite_insert(PicksAndBansS7Model).values(objects_to_insert)
+        stmt = stmt.on_conflict_do_nothing(index_elements=[PicksAndBansS7Model.UniqueLine])
+        result = session.execute(stmt)
+        print(f"Attempted to insert {len(objects_to_insert)} PicksAndBansS7. Rows affected: {result.rowcount}")
+        return result.rowcount
+    except Exception as e: print(f"SQLAlchemy error during PB batch insert: {e}"); return 0
 
 # --- Main Data Collection Logic ---
-def collect_data():
+def collect_data(process_limit=0):
     site = EsportsClient('lol')
-    last_timestamp = get_last_collected_timestamp()
-    print(f"Starting collection. Last collected timestamp from DB: {last_timestamp}") # Debug print
 
-    # Fields for ScoreboardGames (ensure these match the table definition)
-    sg_fields = "SG.OverviewPage, SG.Tournament, SG.Team1, SG.Team2, SG.WinTeam, SG.LossTeam, SG.DateTime_UTC, SG.DST, SG.Team1Score, SG.Team2Score, SG.Winner, SG.Gamelength, SG.Gamelength_Number, SG.Team1Bans, SG.Team2Bans, SG.Team1Picks, SG.Team2Picks, SG.Team1Players, SG.Team2Players, SG.Team1Dragons, SG.Team2Dragons, SG.Team1Barons, SG.Team2Barons, SG.Team1Towers, SG.Team2Towers, SG.Team1Gold, SG.Team2Gold, SG.Team1Kills, SG.Team2Kills, SG.Team1RiftHeralds, SG.Team2RiftHeralds, SG.Team1VoidGrubs, SG.Team2VoidGrubs, SG.Team1Atakhans, SG.Team2Atakhans, SG.Team1Inhibitors, SG.Team2Inhibitors, SG.Patch, SG.LegacyPatch, SG.PatchSort, SG.MatchHistory, SG.VOD, SG.N_Page, SG.N_MatchInTab, SG.N_MatchInPage, SG.N_GameInMatch, SG.Gamename, SG.UniqueLine AS SG_UniqueLine, SG.GameId, SG.MatchId, SG.RiotPlatformGameId, SG.RiotPlatformId, SG.RiotGameId, SG.RiotHash, SG.RiotVersion"
-
-    # Fields for PicksAndBansS7 (ensure these match the table definition)
-    pb_fields = "PB.Team1Role1, PB.Team1Role2, PB.Team1Role3, PB.Team1Role4, PB.Team1Role5, PB.Team2Role1, PB.Team2Role2, PB.Team2Role3, PB.Team2Role4, PB.Team2Role5, PB.Team1Ban1, PB.Team1Ban2, PB.Team1Ban3, PB.Team1Ban4, PB.Team1Ban5, PB.Team1Pick1, PB.Team1Pick2, PB.Team1Pick3, PB.Team1Pick4, PB.Team1Pick5, PB.Team2Ban1, PB.Team2Ban2, PB.Team2Ban3, PB.Team2Ban4, PB.Team2Ban5, PB.Team2Pick1, PB.Team2Pick2, PB.Team2Pick3, PB.Team2Pick4, PB.Team2Pick5, PB.Team1, PB.Team2, PB.Winner, PB.Team1Score, PB.Team2Score, PB.Team1PicksByRoleOrder, PB.Team2PicksByRoleOrder, PB.OverviewPage AS PB_OverviewPage, PB.Phase, PB.UniqueLine AS PB_UniqueLine, PB.IsComplete, PB.IsFilled, PB.Tab, PB.N_Page AS PB_N_Page, PB.N_TabInPage AS PB_N_TabInPage, PB.N_MatchInPage AS PB_N_MatchInPage, PB.N_GameInPage AS PB_N_GameInPage, PB.N_GameInMatch AS PB_N_GameInMatch, PB.N_MatchInTab AS PB_N_MatchInTab, PB.N_GameInTab AS PB_N_GameInTab, PB.GameId AS PB_GameId, PB.MatchId AS PB_MatchId, PB.GameID_Wiki"
-
-    # We need to alias columns that have the same name in both tables
-    # For simplicity, I'll query PicksAndBansS7 first, then ScoreboardGames for those GameIds.
-
-    # These lists should contain the field names as defined in Leaguepedia's Cargo table schema (typically using underscores)
-    all_pb_fields_list = [
-        "Team1Role1", "Team1Role2", "Team1Role3", "Team1Role4", "Team1Role5",
-        "Team2Role1", "Team2Role2", "Team2Role3", "Team2Role4", "Team2Role5",
-        "Team1Ban1", "Team1Ban2", "Team1Ban3", "Team1Ban4", "Team1Ban5",
-        "Team1Pick1", "Team1Pick2", "Team1Pick3", "Team1Pick4", "Team1Pick5",
-        "Team2Ban1", "Team2Ban2", "Team2Ban3", "Team2Ban4", "Team2Ban5",
-        "Team2Pick1", "Team2Pick2", "Team2Pick3", "Team2Pick4", "Team2Pick5",
-        "Team1", "Team2", "Winner", "Team1Score", "Team2Score",
-        "Team1PicksByRoleOrder", "Team2PicksByRoleOrder", "OverviewPage", "Phase",
-        "UniqueLine", "IsComplete", "IsFilled", "Tab",
-        "N_Page", "N_TabInPage", "N_MatchInPage", "N_GameInPage", # Using DB schema names
-        "N_GameInMatch", "N_MatchInTab", "N_GameInTab",          # Using DB schema names
-        "GameId", "MatchId", "GameID_Wiki"                         # Using DB schema names
-    ]
-    all_sg_fields_list = [
-        "OverviewPage", "Tournament", "Team1", "Team2", "WinTeam", "LossTeam",
-        "DateTime_UTC", "DST", "Team1Score", "Team2Score", "Winner", "Gamelength", # Using DB schema names
-        "Gamelength_Number", "Team1Bans", "Team2Bans", "Team1Picks", "Team2Picks", # Using DB schema names
-        "Team1Players", "Team2Players", "Team1Dragons", "Team2Dragons", "Team1Barons",
-        "Team2Barons", "Team1Towers", "Team2Towers", "Team1Gold", "Team2Gold",
-        "Team1Kills", "Team2Kills", "Team1RiftHeralds", "Team2RiftHeralds",
-        "Team1VoidGrubs", "Team2VoidGrubs", "Team1Atakhans", "Team2Atakhans",
-        "Team1Inhibitors", "Team2Inhibitors", "Patch", "LegacyPatch", "PatchSort",
-        "MatchHistory", "VOD", "N_Page", "N_MatchInTab", "N_MatchInPage", # Using DB schema names
-        "N_GameInMatch", "Gamename", "UniqueLine", "GameId", "MatchId",    # Using DB schema names
-        "RiotPlatformGameId", "RiotPlatformId", "RiotGameId", "RiotHash", "RiotVersion"
-    ]
+    all_pb_fields_list = [col.name for col in PicksAndBansS7Model.__table__.columns]
+    all_sg_fields_list = [col.name for col in ScoreboardGame.__table__.columns]
 
     offset = 0
-    total_pb_fetched = 0
-    total_sg_fetched = 0
+    total_pb_fetched_this_run = 0
+    total_sg_fetched_this_run = 0
+    sg_references_processed_count = 0
+
+    last_timestamp = get_last_collected_timestamp()
+    print(f"Starting collection. Last collected timestamp: {last_timestamp}")
 
     while True:
-        print(f"\nFetching ScoreboardGames GameIDs, offset: {offset}")
-        sg_query_params = {
-            'tables': "ScoreboardGames",
-            'fields': "GameId, DateTime_UTC",
-            'order_by': "DateTime_UTC DESC",
-            'limit': BATCH_SIZE,
-            'offset': offset
-        }
-        if last_timestamp:
-            sg_query_params['where'] = f"DateTime_UTC < '{last_timestamp}'"
+        if process_limit > 0 and sg_references_processed_count >= process_limit:
+            print(f"Process limit of {process_limit} ScoreboardGames references reached.")
+            break
 
-        # Step 1: Fetch a batch of GameIds from ScoreboardGames, ordered by DateTime_UTC
-        print(f"Querying ScoreboardGames refs with params: {sg_query_params}")
-        sg_references = site.cargo_client.query(**sg_query_params)
+        current_batch_fetch_limit = BATCH_SIZE
+        if process_limit > 0:
+            remaining_to_fetch = process_limit - sg_references_processed_count
+            if remaining_to_fetch < current_batch_fetch_limit:
+                current_batch_fetch_limit = remaining_to_fetch
+
+        if current_batch_fetch_limit <= 0 and process_limit > 0:
+             print("Limit effectively reached, breaking loop.")
+             break
+
+        print(f"\nFetching SG refs, offset: {offset}, batch_limit: {current_batch_fetch_limit}, processed_count: {sg_references_processed_count}/{process_limit if process_limit > 0 else 'unlimited'}")
+
+        sg_query_params = {
+            'tables': "ScoreboardGames", 'fields': "GameId, DateTime_UTC",
+            'order_by': "DateTime_UTC DESC", 'limit': current_batch_fetch_limit, 'offset': offset
+        }
+        if last_timestamp: sg_query_params['where'] = f"DateTime_UTC < '{last_timestamp}'"
+
+        print(f"Querying ScoreboardGames refs: {sg_query_params}")
+        sg_references = []
+        try:
+            sg_references = site.cargo_client.query(**sg_query_params)
+        except Exception as e:
+            print(f"API error fetching SG refs: {e}. Advancing offset.")
+            offset += current_batch_fetch_limit
+            time.sleep(30)
+            continue
 
         if not sg_references:
             print("No more ScoreboardGames data to fetch.")
             break
 
+        sg_references_processed_count += len(sg_references) # Increment after successful fetch
+
         current_batch_game_ids = list(set([item['GameId'] for item in sg_references if item.get('GameId')]))
-        print(f"Fetched {len(sg_references)} ScoreboardGame references, containing {len(current_batch_game_ids)} unique GameIDs.")
+        print(f"Fetched {len(sg_references)} SG refs, {len(current_batch_game_ids)} unique GameIDs.")
 
         if not current_batch_game_ids:
-            print("No GameIDs in current batch from ScoreboardGames, stopping.")
-            break
-
-        # Step 2: For these GameIDs, find corresponding PicksAndBansS7 entries (UniqueLine)
-        pb_references_for_game_ids = []
-        # Further reduced chunk size from 30 to 20 for PB lookup
-        game_id_chunks_for_pb_lookup = [current_batch_game_ids[i:i + 20] for i in range(0, len(current_batch_game_ids), 20)]
-
-        for chunk in game_id_chunks_for_pb_lookup:
-            if not chunk: continue
-            pb_lookup_query_str = f"'{ "','".join(chunk) }'"
-            current_pb_query_params = {
-                'tables': "PicksAndBansS7",
-                'fields': "UniqueLine, GameId",
-                'where': f"GameId IN ({pb_lookup_query_str})"
-            }
-            print(f"Querying PicksAndBansS7 refs with params: {current_pb_query_params}")
-            pb_refs = site.cargo_client.query(**current_pb_query_params)
-            if pb_refs:
-                pb_references_for_game_ids.extend(pb_refs)
-
-        pb_unique_lines_to_fetch = list(set([item['UniqueLine'] for item in pb_references_for_game_ids if item.get('UniqueLine')]))
-        # GameIds that actually have a PicksAndBansS7 entry
-        game_ids_with_pb_data = list(set([item['GameId'] for item in pb_references_for_game_ids if item.get('GameId')]))
-
-        print(f"Found {len(pb_references_for_game_ids)} PicksAndBansS7 references for these GameIDs, with {len(pb_unique_lines_to_fetch)} unique UniqueLines.")
-
-        if not game_ids_with_pb_data and not pb_unique_lines_to_fetch:
-            print("No corresponding PicksAndBansS7 data found for the current batch of GameIDs. Continuing to next SG batch.")
-            offset += len(sg_references) # Important: advance offset based on sg_references fetched
-            if len(sg_references) < BATCH_SIZE:
-                print("Fetched less than BATCH_SIZE from ScoreboardGames, assuming end of data.")
-                break
-            time.sleep(1)
+            print("No GameIDs in current batch, advancing offset.")
+            offset += len(sg_references) if sg_references else current_batch_fetch_limit
+            if not sg_references or len(sg_references) < current_batch_fetch_limit:
+                 print("Assuming end of data due to empty/partial sg_references batch.")
+                 break
+            time.sleep(10)
             continue
 
+        pb_references_for_game_ids = []
+        for idx, chunk in enumerate([current_batch_game_ids[i:i + 20] for i in range(0, len(current_batch_game_ids), 20)]):
+            if not chunk: continue
+            params = {'tables': "PicksAndBansS7", 'fields': "UniqueLine, GameId", 'where': f"GameId IN ('{ "','".join(chunk) }')"}
+            print(f"Querying PB refs (chunk {idx+1}): {params}")
+            try:
+                refs = site.cargo_client.query(**params)
+                if refs: pb_references_for_game_ids.extend(refs)
+            except Exception as e: print(f"API error fetching PB refs chunk. Error: {e}. Skipping."); time.sleep(5); continue
 
-        # Step 3. Fetch full ScoreboardGames data for game_ids_with_pb_data (or all current_batch_game_ids if desired, for now only those with PB data)
-        sg_data_batch = []
-        if game_ids_with_pb_data: # Only fetch SG data if there's corresponding PB data
-            game_id_chunks_for_sg_fetch = [game_ids_with_pb_data[i:i + 50] for i in range(0, len(game_ids_with_pb_data), 50)]
-            for chunk in game_id_chunks_for_sg_fetch:
-                if not chunk: continue
-                sg_query_str = f"'{ "','".join(chunk) }'"
-                current_sg_fetch_params = {
-                    'tables': "ScoreboardGames",
-                    'fields': ", ".join(all_sg_fields_list),
-                    'where': f"GameId IN ({sg_query_str})"
-                }
-                print(f"Querying full ScoreboardGames with params: {current_sg_fetch_params}")
-                sg_batch_ind = site.cargo_client.query(**current_sg_fetch_params)
-                if sg_batch_ind:
-                    sg_data_batch.extend(sg_batch_ind)
+        pb_unique_lines = list(set([r['UniqueLine'] for r in pb_references_for_game_ids if r.get('UniqueLine')]))
+        game_ids_for_full_fetch = list(set([r['GameId'] for r in pb_references_for_game_ids if r.get('GameId')]))
+        print(f"Found {len(pb_references_for_game_ids)} PB refs for {len(game_ids_for_full_fetch)} GameIDs, with {len(pb_unique_lines)} unique UniqueLines.")
 
-            if sg_data_batch: # Print keys of the first item if data exists
-                print(f"Debug: Keys in received ScoreboardGames data: {list(sg_data_batch[0].keys())}")
-                print(f"Debug: Number of keys: {len(list(sg_data_batch[0].keys()))}")
-                print(f"Debug: Expected number of columns: {len(all_sg_fields_list)}")
+        if not game_ids_for_full_fetch and not pb_unique_lines:
+            print("No PB data for this SG batch. Advancing main offset.")
+            offset += len(sg_references)
+            if len(sg_references) < current_batch_fetch_limit: break
+            time.sleep(10)
+            continue
 
+        session = get_session()
+        try:
+            if game_ids_for_full_fetch:
+                sg_api_data = []
+                for idx, chunk in enumerate([game_ids_for_full_fetch[i:i + 50] for i in range(0, len(game_ids_for_full_fetch), 50)]):
+                    if not chunk: continue
+                    params = {'tables': "ScoreboardGames", 'fields': ", ".join(all_sg_fields_list), 'where': f"GameId IN ('{ "','".join(chunk) }')"}
+                    print(f"Querying full SG (chunk {idx+1}): {params}")
+                    try: data = site.cargo_client.query(**params); sg_api_data.extend(data if data else [])
+                    except Exception as e: print(f"API error full SG. Error: {e}. Skip."); time.sleep(5); continue
+                if sg_api_data: print(f"Debug Keys SG (first): {list(sg_api_data[0].keys()) if sg_api_data else 'N/A'}")
+                print(f"Fetched {len(sg_api_data)} full SG entries.")
+                count = insert_scoreboard_games_batch(session, sg_api_data); total_sg_fetched_this_run += count
 
-            print(f"Fetched {len(sg_data_batch)} full ScoreboardGames entries.")
-            inserted_sg_count = insert_scoreboard_games_batch(sg_data_batch)
-            total_sg_fetched += inserted_sg_count
-        else:
-            print("Skipping ScoreboardGames full data fetch as no corresponding PicksAndBansS7 entries found for this batch.")
+            if pb_unique_lines:
+                pb_api_data = []
+                for idx, chunk in enumerate([pb_unique_lines[i:i + 50] for i in range(0, len(pb_unique_lines), 50)]):
+                    if not chunk: continue
+                    params = {'tables': "PicksAndBansS7", 'fields': ", ".join(all_pb_fields_list), 'where': f"UniqueLine IN ('{ "','".join(chunk) }')"}
+                    print(f"Querying full PB (chunk {idx+1}): {params}")
+                    try: data = site.cargo_client.query(**params); pb_api_data.extend(data if data else [])
+                    except Exception as e: print(f"API error full PB. Error: {e}. Skip."); time.sleep(5); continue
+                if pb_api_data: print(f"Debug Keys PB (first): {list(pb_api_data[0].keys()) if pb_api_data else 'N/A'}")
+                print(f"Fetched {len(pb_api_data)} full PB entries.")
+                count = insert_picks_and_bans_batch(session, pb_api_data); total_pb_fetched_this_run += count
 
+            session.commit(); print("Committed batch.")
+        except Exception as e: print(f"Critical DB/processing error: {e}. Rollback."); session.rollback()
+        finally: session.close()
 
-        # Step 4. Fetch full PicksAndBansS7 data for pb_unique_lines_to_fetch
-        pb_data_batch = []
-        if pb_unique_lines_to_fetch:
-            pb_unique_line_chunks = [pb_unique_lines_to_fetch[i:i + 50] for i in range(0, len(pb_unique_lines_to_fetch), 50)]
-            for chunk in pb_unique_line_chunks:
-                if not chunk: continue
-                pb_query_str = f"'{ "','".join(chunk) }'"
-                pb_batch_ind = site.cargo_client.query(
-                    tables="PicksAndBansS7",
-                    fields=", ".join(all_pb_fields_list),
-                    where=f"UniqueLine IN ({pb_query_str})"
-                )
-                if pb_batch_ind:
-                    pb_data_batch.extend(pb_batch_ind)
-
-            if pb_data_batch: # Debug print for PicksAndBansS7
-                print(f"Debug: Keys in received PicksAndBansS7 data: {list(pb_data_batch[0].keys())}")
-                print(f"Debug: Number of keys in PB data: {len(list(pb_data_batch[0].keys()))}")
-                print(f"Debug: Expected number of PB columns: {len(all_pb_fields_list)}")
-
-
-            print(f"Fetched {len(pb_data_batch)} full PicksAndBansS7 entries.")
-            inserted_pb_count = insert_picks_and_bans_batch(pb_data_batch)
-            total_pb_fetched += inserted_pb_count
-        else:
-            print("Skipping PicksAndBansS7 full data fetch as no UniqueLines were identified for this batch.")
-
-
-        # Advance offset based on the number of ScoreboardGames references fetched initially
         offset += len(sg_references)
-
-        if len(sg_references) < BATCH_SIZE:
-            print("Fetched less than BATCH_SIZE from ScoreboardGames, assuming end of data for current criteria.")
+        if len(sg_references) < current_batch_fetch_limit:
+            print("Fetched fewer SG refs than batch limit, assuming end of relevant data.")
             break
 
-        print("Waiting 10 seconds to respect API rate limits...")
-        time.sleep(10) # Be polite to the API
+        print("Waiting 10s before next main batch fetch...")
+        time.sleep(10)
 
-    print(f"\nData collection complete. Total new ScoreboardGames rows: {total_sg_fetched}, Total new PicksAndBansS7 rows: {total_pb_fetched}")
+    print(f"\nCollection run complete. SG rows affected: {total_sg_fetched_this_run}, PB rows affected: {total_pb_fetched_this_run}")
 
 if __name__ == '__main__':
-    # Ensure tables exist
-    from . import db_setup
-    db_setup.create_tables()
-
-    collect_data()
+    import argparse
+    parser = argparse.ArgumentParser(description="Collect League of Legends match data from Leaguepedia.")
+    parser.add_argument(
+        "--limit", type=int, default=500,
+        help="Max ScoreboardGames references to process. 0 for no limit. Default: 500."
+    )
+    args = parser.parse_args()
+    print(f"Starting data collection (SQLAlchemy) with limit: {args.limit if args.limit > 0 else 'No limit'}")
+    collect_data(process_limit=args.limit)
+    print("Data collection process finished.")
